@@ -318,50 +318,17 @@ class ScratchProjectBuilder:
         return track_voices
 
     def generate_project_json(self, track_voices):
-        self._log("プロジェクトJSON生成開始 (自己修正同期機能付き)")
+        self._log("プロジェクトJSON生成開始")
         targets = []
 
-        # ===== ステージ（指揮者） =====
-        # ステージ用のブロックID生成
-        stage_blocks = {}
-        stage_b_counter = 0
-        def stage_get_id():
-            nonlocal stage_b_counter
-            stage_b_counter += 1
-            return f"b_stage_{stage_b_counter}"
-
-        # 1) 旗クリック
-        stage_prev = stage_get_id()
-        stage_blocks[stage_prev] = {
-            "opcode": "event_whenflagclicked",
-            "next": None,
-            "parent": None,
-            "inputs": {},
-            "fields": {},
-            "shadow": False,
-            "topLevel": True
-        }
-        # 2) 同報送信 "SYNC_START"
-        stage_curr = stage_get_id()
-        stage_blocks[stage_prev]["next"] = stage_curr
-        stage_blocks[stage_curr] = {
-            "opcode": "event_broadcast",
-            "next": None,
-            "parent": stage_prev,
-            "inputs": {"BROADCAST_INPUT": [2, "SYNC_START"]},
-            "fields": {},
-            "shadow": False,
-            "topLevel": False
-        }
-
-        # ステージオブジェクト
+        # ===== ステージ（何もしない） =====
         stage = {
             "isStage": True,
             "name": "Stage",
             "variables": {},
             "lists": {},
             "broadcasts": {},
-            "blocks": stage_blocks,
+            "blocks": {},
             "comments": {},
             "currentCostume": 0,
             "costumes": [{"assetId": self.svg_md5, "name": "backdrop1", "md5ext": self.svg_filename, "dataFormat": "svg"}],
@@ -378,13 +345,13 @@ class ScratchProjectBuilder:
             blocks = {}
             volume = tv['volume']
 
-            def add_block(b_id, opcode, next_id, parent_id, inputs=None, top=False):
+            def add_block(b_id, opcode, next_id, parent_id, inputs=None, fields=None, top=False):
                 blocks[b_id] = {
                     "opcode": opcode,
                     "next": next_id,
                     "parent": parent_id,
                     "inputs": inputs or {},
-                    "fields": {},
+                    "fields": fields or {},
                     "shadow": False,
                     "topLevel": top
                 }
@@ -395,14 +362,13 @@ class ScratchProjectBuilder:
                 b_counter += 1
                 return f"b_{sprite_name}_{b_counter}"
 
-            # ★ 起動トリガーを「SYNC_START受信」に変更（自己修正同期）
+            # 旗クリックで起動（同期なし・シンプル）
             prev_id = get_id()
             add_block(
                 prev_id,
-                "event_whenbroadcastreceived",
+                "event_whenflagclicked",
                 None,
                 None,
-                inputs={"BROADCAST_OPTION": [2, "SYNC_START"]},
                 top=True
             )
 
