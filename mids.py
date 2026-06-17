@@ -20,7 +20,7 @@ def log_message(msg, log_widget=None, log_file="converter.log"):
     except:
         pass
 
-# --- マッピング（変更なし）---
+# --- マッピング ---
 def get_scratch_instrument(midi_program, genre="general"):
     if 120 <= midi_program <= 127: return None
     if genre == "orchestra":
@@ -105,7 +105,7 @@ class ScratchProjectBuilder:
         self.ticks_per_beat = self.midi.ticks_per_beat
         self.tempo = 120
         self.tempo_map = []
-        self.max_concurrent_notes = 6   # ← 同時発音数の上限
+        self.max_concurrent_notes = 6
         self.svg_data = '<svg version="1.1" width="2" height="2" viewBox="-1 -1 2 2" xmlns="http://www.w3.org/2000/svg"></svg>'.encode('utf-8')
         self.svg_md5 = hashlib.md5(self.svg_data).hexdigest()
         self.svg_filename = f"{self.svg_md5}.svg"
@@ -161,41 +161,73 @@ class ScratchProjectBuilder:
         self._log(f"音量計算完了: メイン {track_volumes.get(self.main_track_idx, 100)}, 他 {len(other_tracks)}トラック")
         return track_volumes
 
+    def rank_voices(self, track_voices):
+        self._log("ボイスランク付け開始")
+        for tv in track_voices:
+            notes = tv['notes']
+            if not notes:
+                tv['score'] = 0
+                continue
+            total_duration = sum(n.end_tick - n.start_tick for n in notes)
+            pitches = [n.pitch for n in notes]
+            pitch_range = max(pitches) - min(pitches)
+            avg_vel = sum(n.velocity for n in notes) / len(notes)
+            score = (len(notes) * 10) + (total_duration / 100) + (pitch_range * 5) + (avg_vel / 10)
+            mult = get_genre_multiplier(tv['instrument'], self.genre)
+            tv['score'] = score * mult
+
+        track_voices.sort(key=lambda x: x['score'], reverse=True)
+        for idx, tv in enumerate(track_voices):
+            tv['rank'] = idx
+            self._log(f"  ランク{idx}: Track{tv['track_idx']} Voice{tv['voice_idx']} (スコア={tv['score']:.1f})")
+        self._log(f"ランク付け完了: {len(track_voices)}ボイス")
+
     def limit_concurrent_notes(self, track_voices):
-        """同時発音数を制限（優先度順に間引く）"""
         self._log(f"同時発音制限開始 (上限={self.max_concurrent_notes})")
-        # 全ノートを (開始, 終了, ボイスインデックス, ノートインデックス) のリストに変換
         all_notes = []
         for vi, tv in enumerate(track_voices):
+            rank = tv['rank']
             for ni, note in enumerate(tv['notes']):
-                all_notes.append((note.start_tick, note.end_tick, vi, ni))
-        # 開始時間でソート
+                all_notes.append((note.start_tick, note.end_tick, vi, ni, rank))
         all_notes.sort(key=lambda x: x[0])
 
-        # アクティブなノートを管理（終了時間でソートされたヒープ代わりにリストで簡易実装）
-        active = []  # (end_tick, vi, ni)
-        to_remove = set()  # (vi, ni) のセット
+        active = []
+        to_remove = set()
+        protected_ranks = {0, 1, 2}
 
-        for start, end, vi, ni in all_notes:
-            # 終了したノートを除去
+        for start, end, vi, ni, rank in all_notes:
             active = [a for a in active if a[0] > start]
-            # 現在の同時発音数をチェック
-            if len(active) >= self.max_concurrent_notes:
-                # 制限を超えたら、このノートを削除対象にする（後ろのボイスほど優先度が低い）
-                to_remove.add((vi, ni))
-                self._log(f"  ノート削除: ボイス{vi}, ノート{ni} (同時発音 {len(active)+1}->{self.max_concurrent_notes})")
-            else:
-                # アクティブに追加
-                active.append((end, vi, ni))
 
-        # 削除対象を実際に track_voices から除去
+            if len(active) >= self.max_concurrent_notes:
+                if rank in protected_ranks:
+                    unprotected = [a for a in active if a[3] not in protected_ranks]
+                    if unprotected:
+                        to_remove_unprotected = max(unprotected, key=lambda x: x[3])
+                        active.remove(to_remove_unprotected)
+                        to_remove.add((to_remove_unprotected[1], to_remove_unprotected[2]))
+                        active.append((end, vi, ni, rank))
+                    else:
+                        self._log(f"  保護ノート強制追加: ボイス{vi}, ノート{ni} (同時発音 {len(active)+1})")
+                        active.append((end, vi, ni, rank))
+                else:
+                    unprotected = [a for a in active if a[3] not in protected_ranks]
+                    if unprotected:
+                        to_remove_unprotected = max(unprotected, key=lambda x: x[3])
+                        active.remove(to_remove_unprotected)
+                        to_remove.add((to_remove_unprotected[1], to_remove_unprotected[2]))
+                        active.append((end, vi, ni, rank))
+                    else:
+                        to_remove.add((vi, ni))
+                        self._log(f"  非保護ノート削除: ボイス{vi}, ノート{ni} (保護ノートが優先)")
+            else:
+                active.append((end, vi, ni, rank))
+
         for vi, tv in enumerate(track_voices):
             new_notes = []
             for ni, note in enumerate(tv['notes']):
                 if (vi, ni) not in to_remove:
                     new_notes.append(note)
             tv['notes'] = new_notes
-        # 空になったボイスは除去（必要に応じて）
         track_voices[:] = [tv for tv in track_voices if tv['notes']]
         self._log(f"同時発音制限完了: {len(to_remove)}ノート削除, 残りボイス数={len(track_voices)}")
 
@@ -279,47 +311,114 @@ class ScratchProjectBuilder:
                     'is_main': is_main,
                     'volume': track_volumes.get(track_idx, 40)
                 })
-        # ★ 同時発音制限を適用 ★
+
+        self.rank_voices(track_voices)
         self.limit_concurrent_notes(track_voices)
         self._log(f"MIDI解析完了: {len(track_voices)}ボイス抽出")
         return track_voices
 
     def generate_project_json(self, track_voices):
-        self._log("プロジェクトJSON生成開始")
+        self._log("プロジェクトJSON生成開始 (自己修正同期機能付き)")
         targets = []
+
+        # ===== ステージ（指揮者） =====
+        # ステージ用のブロックID生成
+        stage_blocks = {}
+        stage_b_counter = 0
+        def stage_get_id():
+            nonlocal stage_b_counter
+            stage_b_counter += 1
+            return f"b_stage_{stage_b_counter}"
+
+        # 1) 旗クリック
+        stage_prev = stage_get_id()
+        stage_blocks[stage_prev] = {
+            "opcode": "event_whenflagclicked",
+            "next": None,
+            "parent": None,
+            "inputs": {},
+            "fields": {},
+            "shadow": False,
+            "topLevel": True
+        }
+        # 2) 同報送信 "SYNC_START"
+        stage_curr = stage_get_id()
+        stage_blocks[stage_prev]["next"] = stage_curr
+        stage_blocks[stage_curr] = {
+            "opcode": "event_broadcast",
+            "next": None,
+            "parent": stage_prev,
+            "inputs": {"BROADCAST_INPUT": [2, "SYNC_START"]},
+            "fields": {},
+            "shadow": False,
+            "topLevel": False
+        }
+
+        # ステージオブジェクト
         stage = {
-            "isStage": True, "name": "Stage", "variables": {}, "lists": {}, "broadcasts": {},
-            "blocks": {}, "comments": {}, "currentCostume": 0,
+            "isStage": True,
+            "name": "Stage",
+            "variables": {},
+            "lists": {},
+            "broadcasts": {},
+            "blocks": stage_blocks,
+            "comments": {},
+            "currentCostume": 0,
             "costumes": [{"assetId": self.svg_md5, "name": "backdrop1", "md5ext": self.svg_filename, "dataFormat": "svg"}],
-            "sounds": [], "volume": 100, "layerOrder": 0, "tempo": self.tempo
+            "sounds": [],
+            "volume": 100,
+            "layerOrder": 0,
+            "tempo": self.tempo
         }
         targets.append(stage)
 
+        # ===== 各スプライト（演奏者） =====
         for idx, tv in enumerate(track_voices):
-            sprite_name = f"Track{tv['track_idx']}_Voice{tv['voice_idx']}_Vol{tv['volume']}"
+            sprite_name = f"R{tv['rank']}_T{tv['track_idx']}_V{tv['voice_idx']}_Vol{tv['volume']}"
             blocks = {}
             volume = tv['volume']
+
             def add_block(b_id, opcode, next_id, parent_id, inputs=None, top=False):
                 blocks[b_id] = {
-                    "opcode": opcode, "next": next_id, "parent": parent_id,
-                    "inputs": inputs or {}, "fields": {}, "shadow": False, "topLevel": top
+                    "opcode": opcode,
+                    "next": next_id,
+                    "parent": parent_id,
+                    "inputs": inputs or {},
+                    "fields": {},
+                    "shadow": False,
+                    "topLevel": top
                 }
+
             b_counter = 0
-            def get_id(): nonlocal b_counter; b_counter += 1; return f"b_{sprite_name}_{b_counter}"
+            def get_id():
+                nonlocal b_counter
+                b_counter += 1
+                return f"b_{sprite_name}_{b_counter}"
 
+            # ★ 起動トリガーを「SYNC_START受信」に変更（自己修正同期）
             prev_id = get_id()
-            add_block(prev_id, "event_whenflagclicked", None, None, top=True)
+            add_block(
+                prev_id,
+                "event_whenbroadcastreceived",
+                None,
+                None,
+                inputs={"BROADCAST_OPTION": [2, "SYNC_START"]},
+                top=True
+            )
 
+            # 音量設定
             curr_id = get_id()
             blocks[prev_id]["next"] = curr_id
             add_block(curr_id, "sound_setvolumeto", None, prev_id, {"VOLUME": [1, [4, str(volume)]]})
             prev_id = curr_id
 
+            # 初期テンポ設定
             curr_id = get_id()
             blocks[prev_id]["next"] = curr_id
             add_block(curr_id, "music_setTempo", None, prev_id, {"TEMPO": [1, [4, str(self.tempo_map[0][1])]]})
             prev_id = curr_id
 
+            # 楽器設定（ドラム以外）
             if not tv['is_drum']:
                 curr_id = get_id()
                 blocks[prev_id]["next"] = curr_id
@@ -327,9 +426,11 @@ class ScratchProjectBuilder:
                 add_block(curr_id, "music_setInstrument", None, prev_id, {"INSTRUMENT": [1, [4, str(inst_scratch)]]})
                 prev_id = curr_id
 
+            # ノート演奏（テンポ変更処理付き）
             current_tick = 0
             tempo_idx = 0
             for note in tv['notes']:
+                # テンポ変更処理
                 while tempo_idx + 1 < len(self.tempo_map) and self.tempo_map[tempo_idx+1][0] <= note.start_tick:
                     next_tick, next_bpm = self.tempo_map[tempo_idx+1]
                     wait_ticks = next_tick - current_tick
@@ -346,6 +447,7 @@ class ScratchProjectBuilder:
                     prev_id = curr_id
                     tempo_idx += 1
 
+                # ノート開始までの待機
                 wait_ticks = note.start_tick - current_tick
                 if wait_ticks > 0.01:
                     wait_beats = wait_ticks / self.ticks_per_beat
@@ -355,6 +457,7 @@ class ScratchProjectBuilder:
                     prev_id = curr_id
                     current_tick = note.start_tick
 
+                # ノート演奏
                 dur_ticks = note.end_tick - note.start_tick
                 dur_beats = dur_ticks / self.ticks_per_beat
                 curr_id = get_id()
@@ -362,20 +465,35 @@ class ScratchProjectBuilder:
                 if tv['is_drum']:
                     drum_val = get_scratch_drum(note.pitch)
                     add_block(curr_id, "music_playDrumForBeats", None, prev_id, {
-                        "DRUM": [1, [4, str(drum_val)]], "BEATS": [1, [4, str(dur_beats)]]
+                        "DRUM": [1, [4, str(drum_val)]],
+                        "BEATS": [1, [4, str(dur_beats)]]
                     })
                 else:
                     add_block(curr_id, "music_playNoteForBeats", None, prev_id, {
-                        "NOTE": [1, [4, str(note.pitch)]], "BEATS": [1, [4, str(dur_beats)]]
+                        "NOTE": [1, [4, str(note.pitch)]],
+                        "BEATS": [1, [4, str(dur_beats)]]
                     })
                 prev_id = curr_id
                 current_tick = note.end_tick
 
             sprite = {
-                "isStage": False, "name": sprite_name, "variables": {}, "lists": {}, "broadcasts": {},
-                "blocks": blocks, "comments": {}, "currentCostume": 0,
+                "isStage": False,
+                "name": sprite_name,
+                "variables": {},
+                "lists": {},
+                "broadcasts": {},
+                "blocks": blocks,
+                "comments": {},
+                "currentCostume": 0,
                 "costumes": [{"assetId": self.svg_md5, "name": "costume1", "md5ext": self.svg_filename, "dataFormat": "svg"}],
-                "sounds": [], "volume": 100, "layerOrder": idx + 1, "visible": True, "x": 0, "y": 0, "size": 100, "direction": 90
+                "sounds": [],
+                "volume": 100,
+                "layerOrder": idx + 1,
+                "visible": True,
+                "x": 0,
+                "y": 0,
+                "size": 100,
+                "direction": 90
             }
             targets.append(sprite)
 
@@ -398,12 +516,12 @@ class ScratchProjectBuilder:
         self._log(f"sb3出力完了: {output_path}")
         return output_path
 
-# --- GUI（ログエリア付き・変更なし）---
+# --- GUI ---
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MIDI to Scratch 3.0 Converter")
-        self.geometry("520x550")
+        self.geometry("520x580")
         self.midi_path = None
         self.track_names = []
 
@@ -435,7 +553,7 @@ class App(tk.Tk):
         self.btn_convert.pack(pady=10)
 
         tk.Label(self, text="--- 操作ログ ---", font=("", 10, "bold")).pack(pady=(5,0))
-        self.log_text = scrolledtext.ScrolledText(self, height=12, state='normal', font=("Courier", 9))
+        self.log_text = scrolledtext.ScrolledText(self, height=14, state='normal', font=("Courier", 9))
         self.log_text.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
         self.log_message("アプリケーション起動")
 
