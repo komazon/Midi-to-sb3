@@ -6,6 +6,9 @@ import zipfile
 import os
 import hashlib
 from datetime import datetime
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 # --- ログ関数 ---
 def log_message(msg, log_widget=None, log_file="converter.log"):
@@ -21,7 +24,19 @@ def log_message(msg, log_widget=None, log_file="converter.log"):
         pass
 
 # --- マッピング ---
-def get_scratch_instrument(midi_program, genre="general"):
+CHOIR_KEYWORDS = ["合唱", "コーラス", "クワイア", "choir", "chorus"]
+CHOIR_SCRATCH_INSTRUMENT = 15
+CUICA_SCRATCH_DRUM = 18
+
+def is_choir_track(track_name):
+    if not track_name:
+        return False
+    name_lower = track_name.lower()
+    return any(kw.lower() in name_lower for kw in CHOIR_KEYWORDS)
+
+def get_scratch_instrument(midi_program, genre="general", track_name=None):
+    if is_choir_track(track_name):
+        return CHOIR_SCRATCH_INSTRUMENT
     if 120 <= midi_program <= 127: return None
     if genre == "orchestra":
         if 24 <= midi_program <= 39: return 7
@@ -71,7 +86,10 @@ def get_scratch_drum(midi_note):
         76: 10, 77: 10, 56: 11, 81: 12, 80: 12, 60: 13, 61: 13, 62: 14, 63: 14,
         64: 14, 69: 15,
     }
-    return mapping.get(midi_note, 1)
+    result = mapping.get(midi_note, 1)
+    if result == CUICA_SCRATCH_DRUM:
+        return None
+    return result
 
 def get_genre_multiplier(program, genre):
     if genre == "orchestra":
@@ -96,20 +114,83 @@ class MidiNote:
         self.end_tick = None
 
 class ScratchProjectBuilder:
-    def __init__(self, midi_path, main_track_idx, genre, log_callback=None):
+    STAGE_W = 480
+    STAGE_H = 360
+    FALL_LEAD_TIME = 2.0
+    FALL_TOP_Y = 160
+    KEYBOARD_TOP_Y = -100
+    KEYBOARD_BOTTOM_Y = -180
+    MIN_BAR_HEIGHT_PX = 6
+    HEIGHT_ROUND_PX = 4
+
+    def __init__(self, midi_path, main_track_idx, genre, enable_piano_roll=False, log_callback=None):
         self.midi_path = midi_path
         self.main_track_idx = int(main_track_idx)
         self.genre = genre
+        self.enable_piano_roll = enable_piano_roll
         self.log_callback = log_callback
         self.midi = mido.MidiFile(midi_path)
         self.ticks_per_beat = self.midi.ticks_per_beat
         self.tempo = 120
         self.tempo_map = []
-        self.max_concurrent_notes = 6
-        self.svg_data = '<svg version="1.1" width="2" height="2" viewBox="-1 -1 2 2" xmlns="http://www.w3.org/2000/svg"></svg>'.encode('utf-8')
+
+        # --- 外部画像読み込み（優先） ---
+        self.background_image_path = str(BASE_DIR / "data" / "img" / "blackscreen.png")
+        self.keyboard_image_path = str(BASE_DIR / "data" / "img" / "piano.png")
+        self.use_external_images = False
+
+        # 背景画像の読み込みを試行
+        if os.path.exists(self.background_image_path):
+            try:
+                with open(self.background_image_path, "rb") as f:
+                    self.svg_data = f.read()
+                self.svg_md5 = hashlib.md5(self.svg_data).hexdigest()
+                self.svg_filename = f"{self.svg_md5}.png"
+                self._log(f"背景画像を読み込みました: {self.background_image_path}")
+                self.use_external_images = True
+            except Exception as e:
+                self._log(f"背景画像読み込みエラー: {e}、SVGフォールバックを使用")
+                self._generate_fallback_background()
+        else:
+            self._generate_fallback_background()
+
+        # 鍵盤画像を事前に読み込んで保持（_prepare_piano_rollで使う）
+        self.keyboard_image_data = None
+        if os.path.exists(self.keyboard_image_path):
+            try:
+                with open(self.keyboard_image_path, "rb") as f:
+                    self.keyboard_image_data = f.read()
+                self._log(f"鍵盤画像を読み込みました: {self.keyboard_image_path}")
+            except Exception as e:
+                self._log(f"鍵盤画像読み込みエラー: {e}、自動生成にフォールバック")
+                self.keyboard_image_data = None
+
+        # ピアノロール用の状態
+        self.pr_ready = False
+        self.pr_pitch_min = None
+        self.pr_pitch_max = None
+        self.pr_key_width = None
+        self.pr_height_buckets = {}
+        self.pr_track_hues = {}
+        self.pr_extra_assets = {}
+        self.pr_keyboard_costume = None
+        self._log("ScratchProjectBuilder初期化完了")
+
+    def _generate_fallback_background(self):
+        """フォールバック用グラデーション背景SVG"""
+        self.svg_data = '''
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="-240 -180 480 360">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#16213e"/>
+    </linearGradient>
+  </defs>
+  <rect width="480" height="360" fill="url(#bgGrad)"/>
+</svg>
+'''.encode('utf-8')
         self.svg_md5 = hashlib.md5(self.svg_data).hexdigest()
         self.svg_filename = f"{self.svg_md5}.svg"
-        self._log("ScratchProjectBuilder初期化完了")
 
     def _log(self, msg):
         if self.log_callback:
@@ -132,7 +213,7 @@ class ScratchProjectBuilder:
                     is_drum = True
                 if msg.type == 'note_on' and msg.velocity > 0:
                     if is_drum and get_scratch_drum(msg.note) is None: continue
-                    if not is_drum and get_scratch_instrument(current_instrument, self.genre) is None: continue
+                    if not is_drum and get_scratch_instrument(current_instrument, self.genre, track.name) is None: continue
                     note_count += 1
                     total_pitch += msg.note
             score = 0
@@ -182,58 +263,176 @@ class ScratchProjectBuilder:
             self._log(f"  ランク{idx}: Track{tv['track_idx']} Voice{tv['voice_idx']} (スコア={tv['score']:.1f})")
         self._log(f"ランク付け完了: {len(track_voices)}ボイス")
 
-    def limit_concurrent_notes(self, track_voices):
-        self._log(f"同時発音制限開始 (上限={self.max_concurrent_notes})")
-        all_notes = []
-        for vi, tv in enumerate(track_voices):
-            rank = tv['rank']
-            for ni, note in enumerate(tv['notes']):
-                all_notes.append((note.start_tick, note.end_tick, vi, ni, rank))
-        all_notes.sort(key=lambda x: x[0])
-
-        active = []
-        to_remove = set()
-        protected_ranks = {0, 1, 2}
-
-        for start, end, vi, ni, rank in all_notes:
-            active = [a for a in active if a[0] > start]
-
-            if len(active) >= self.max_concurrent_notes:
-                if rank in protected_ranks:
-                    unprotected = [a for a in active if a[3] not in protected_ranks]
-                    if unprotected:
-                        to_remove_unprotected = max(unprotected, key=lambda x: x[3])
-                        active.remove(to_remove_unprotected)
-                        to_remove.add((to_remove_unprotected[1], to_remove_unprotected[2]))
-                        active.append((end, vi, ni, rank))
-                    else:
-                        self._log(f"  保護ノート強制追加: ボイス{vi}, ノート{ni} (同時発音 {len(active)+1})")
-                        active.append((end, vi, ni, rank))
-                else:
-                    unprotected = [a for a in active if a[3] not in protected_ranks]
-                    if unprotected:
-                        to_remove_unprotected = max(unprotected, key=lambda x: x[3])
-                        active.remove(to_remove_unprotected)
-                        to_remove.add((to_remove_unprotected[1], to_remove_unprotected[2]))
-                        active.append((end, vi, ni, rank))
-                    else:
-                        to_remove.add((vi, ni))
-                        self._log(f"  非保護ノート削除: ボイス{vi}, ノート{ni} (保護ノートが優先)")
+    def apply_strict_volume_control(self, track_voices, track_volumes):
+        self._log("厳格音量調整開始")
+        for tv in track_voices:
+            if tv['is_main']:
+                base_vol = 100
             else:
-                active.append((end, vi, ni, rank))
+                base_vol = track_volumes.get(tv['track_idx'], 40)
+            rank = tv.get('rank', 0)
+            decay = max(0.4, 1.0 - rank * 0.05)
+            strict_vol = base_vol * decay
+            min_vol = 15 if tv['is_drum'] else 10
+            strict_vol = max(min_vol, min(100, strict_vol))
+            tv['volume'] = int(round(strict_vol))
+            self._log(f"  Track{tv['track_idx']} Voice{tv['voice_idx']} (rank={rank}) → 音量{tv['volume']}")
+        self._log(f"厳格音量調整完了: {len(track_voices)}ボイス")
 
-        for vi, tv in enumerate(track_voices):
-            new_notes = []
-            for ni, note in enumerate(tv['notes']):
-                if (vi, ni) not in to_remove:
-                    new_notes.append(note)
-            tv['notes'] = new_notes
-        track_voices[:] = [tv for tv in track_voices if tv['notes']]
-        self._log(f"同時発音制限完了: {len(to_remove)}ノート削除, 残りボイス数={len(track_voices)}")
+    # ===== ピアノロール関連 =====
+    def _tick_to_seconds(self, tick):
+        seconds = 0.0
+        prev_tick, prev_bpm = self.tempo_map[0]
+        for next_tick, next_bpm in self.tempo_map[1:]:
+            if tick <= next_tick:
+                break
+            seconds += (next_tick - prev_tick) * (60.0 / prev_bpm) / self.ticks_per_beat
+            prev_tick, prev_bpm = next_tick, next_bpm
+        seconds += max(0, tick - prev_tick) * (60.0 / prev_bpm) / self.ticks_per_beat
+        return seconds
+
+    def _pitch_to_x(self, pitch):
+        """ピッチを鍵盤上のX座標に変換（鍵盤全体の中心が0になるようオフセット）"""
+        key_index = pitch - self.pr_pitch_min
+        total_width = (self.pr_pitch_max - self.pr_pitch_min + 1) * self.pr_key_width
+        return -total_width / 2 + (key_index + 0.5) * self.pr_key_width
+
+    def _duration_to_height_px(self, duration_seconds):
+        fall_distance = self.FALL_TOP_Y - self.KEYBOARD_TOP_Y
+        pixels_per_second = fall_distance / self.FALL_LEAD_TIME
+        height = duration_seconds * pixels_per_second
+        height = max(self.MIN_BAR_HEIGHT_PX, height)
+        height = round(height / self.HEIGHT_ROUND_PX) * self.HEIGHT_ROUND_PX
+        return int(height)
+
+    def _build_keyboard_svg(self, pitch_min, pitch_max, key_width, height):
+        """フォールバック用：簡易ピアノ鍵盤のSVGを生成"""
+        width = self.STAGE_W
+        half_w = width / 2
+        half_h = height / 2
+        total_keys = pitch_max - pitch_min + 1
+        total_width = total_keys * key_width
+        offset_x = -total_width / 2
+
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{-half_w} {-half_h} {width} {height}" '
+            f'width="{width}" height="{height}">',
+            f'<rect x="{-half_w}" y="{-half_h}" width="{width}" height="{height}" fill="#1a1a1a"/>'
+        ]
+        for i, pitch in enumerate(range(pitch_min, pitch_max + 1)):
+            x = offset_x + i * key_width
+            is_black = (pitch % 12) in (1, 3, 6, 8, 10)
+            fill = "#1a1a1a" if is_black else "#f5f5f5"
+            black_h = height * 0.62
+            y = -half_h if is_black else -half_h
+            h = black_h if is_black else height
+            parts.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{key_width:.2f}" height="{h:.2f}" '
+                f'fill="{fill}" stroke="#555555" stroke-width="0.6"/>'
+            )
+        parts.append('</svg>')
+        return "".join(parts).encode('utf-8')
+
+    def _build_notebar_svg(self, width, height):
+        half_w = width / 2
+        half_h = height / 2
+        inner_w = max(width - 1, 1)
+        inner_h = max(height - 1, 1)
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{-half_w} {-half_h} {width} {height}" '
+            f'width="{width:.2f}" height="{height:.2f}">'
+            f'<rect x="{-inner_w/2:.2f}" y="{-inner_h/2:.2f}" width="{inner_w:.2f}" height="{inner_h:.2f}" '
+            f'rx="3" ry="3" fill="#ff5a5f" stroke="#7a1115" stroke-width="1.2"/>'
+            f'</svg>'
+        )
+        return svg.encode('utf-8')
+
+    def _prepare_piano_roll(self, track_voices):
+        self._log("ピアノロール準備開始")
+        pitches = []
+        durations = []
+        for tv in track_voices:
+            if tv['is_drum']:
+                continue
+            for note in tv['notes']:
+                pitches.append(note.pitch)
+                onset = self._tick_to_seconds(note.start_tick)
+                end = self._tick_to_seconds(note.end_tick)
+                durations.append(max(0.0, end - onset))
+
+        if not pitches:
+            self._log("ピアノロール準備スキップ: 鍵盤に表示できる音程付きノートがありません")
+            self.pr_ready = False
+            return
+
+        pitch_min = min(pitches) - 2
+        pitch_max = max(pitches) + 2
+        min_span = 24
+        span = pitch_max - pitch_min + 1
+        if span < min_span:
+            pad = (min_span - span)
+            pitch_min -= pad // 2
+            pitch_max += pad - (pad // 2)
+        pitch_min = max(0, pitch_min)
+        pitch_max = min(127, pitch_max)
+
+        self.pr_pitch_min = pitch_min
+        self.pr_pitch_max = pitch_max
+        num_keys = pitch_max - pitch_min + 1
+        self.pr_key_width = self.STAGE_W / num_keys
+
+        keyboard_height = self.KEYBOARD_TOP_Y - self.KEYBOARD_BOTTOM_Y
+        bar_width = max(self.pr_key_width - 2, 2)
+        unique_heights = sorted({self._duration_to_height_px(d) for d in durations})
+        self.pr_height_buckets = {}
+        for h in unique_heights:
+            svg_bytes = self._build_notebar_svg(bar_width, h)
+            md5 = hashlib.md5(svg_bytes).hexdigest()
+            filename = f"{md5}.svg"
+            costume_name = f"note_{h}"
+            self.pr_extra_assets[filename] = svg_bytes
+            self.pr_height_buckets[h] = {
+                "name": costume_name,
+                "assetId": md5,
+                "md5ext": filename,
+                "dataFormat": "svg"
+            }
+
+        # --- 鍵盤コスチューム（外部画像優先） ---
+        if self.keyboard_image_data is not None:
+            kb_md5 = hashlib.md5(self.keyboard_image_data).hexdigest()
+            kb_filename = f"{kb_md5}.png"
+            self.pr_extra_assets[kb_filename] = self.keyboard_image_data
+            self.pr_keyboard_costume = {
+                "name": "keyboard",
+                "assetId": kb_md5,
+                "md5ext": kb_filename,
+                "dataFormat": "png"
+            }
+            self._log("鍵盤コスチュームに外部画像を使用")
+        else:
+            # フォールバック：SVGで鍵盤を生成
+            keyboard_svg = self._build_keyboard_svg(pitch_min, pitch_max, self.pr_key_width, keyboard_height)
+            kb_md5 = hashlib.md5(keyboard_svg).hexdigest()
+            kb_filename = f"{kb_md5}.svg"
+            self.pr_extra_assets[kb_filename] = keyboard_svg
+            self.pr_keyboard_costume = {
+                "name": "keyboard",
+                "assetId": kb_md5,
+                "md5ext": kb_filename,
+                "dataFormat": "svg"
+            }
+            self._log("鍵盤コスチュームにSVGフォールバックを使用")
+
+        track_idxs = sorted({tv['track_idx'] for tv in track_voices if not tv['is_drum']})
+        n = max(len(track_idxs), 1)
+        self.pr_track_hues = {t: round(i * 200 / n) % 200 for i, t in enumerate(track_idxs)}
+
+        self.pr_ready = True
+        self._log(f"ピアノロール準備完了: 鍵盤範囲={pitch_min}-{pitch_max}, バー種類={len(unique_heights)}")
 
     def parse_midi(self):
         self._log("MIDI解析開始")
-        # テンポマップ
         tempo_events = []
         for track in self.midi.tracks:
             abs_tick = 0
@@ -280,7 +479,7 @@ class ScratchProjectBuilder:
                     is_drum = True
                 if msg.type == 'note_on' and msg.velocity > 0:
                     if is_drum and get_scratch_drum(msg.note) is None: continue
-                    if not is_drum and get_scratch_instrument(current_instrument, self.genre) is None: continue
+                    if not is_drum and get_scratch_instrument(current_instrument, self.genre, track.name) is None: continue
                     active_notes[msg.note] = MidiNote(msg.note, abs_tick, msg.velocity)
                 elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
                     if msg.note in active_notes:
@@ -307,13 +506,14 @@ class ScratchProjectBuilder:
                     'voice_idx': voice_idx + 1,
                     'notes': voice,
                     'instrument': current_instrument,
+                    'track_name': track.name,
                     'is_drum': is_drum,
                     'is_main': is_main,
                     'volume': track_volumes.get(track_idx, 40)
                 })
 
         self.rank_voices(track_voices)
-        self.limit_concurrent_notes(track_voices)
+        self.apply_strict_volume_control(track_voices, track_volumes)
         self._log(f"MIDI解析完了: {len(track_voices)}ボイス抽出")
         return track_voices
 
@@ -321,7 +521,9 @@ class ScratchProjectBuilder:
         self._log("プロジェクトJSON生成開始")
         targets = []
 
-        # ===== ステージ（何もしない） =====
+        # ステージ（背景）
+        # 外部画像が読み込まれていれば dataFormat は png、そうでなければ svg
+        bg_format = "png" if self.use_external_images else "svg"
         stage = {
             "isStage": True,
             "name": "Stage",
@@ -331,7 +533,7 @@ class ScratchProjectBuilder:
             "blocks": {},
             "comments": {},
             "currentCostume": 0,
-            "costumes": [{"assetId": self.svg_md5, "name": "backdrop1", "md5ext": self.svg_filename, "dataFormat": "svg"}],
+            "costumes": [{"assetId": self.svg_md5, "name": "backdrop1", "md5ext": self.svg_filename, "dataFormat": bg_format}],
             "sounds": [],
             "volume": 100,
             "layerOrder": 0,
@@ -339,20 +541,74 @@ class ScratchProjectBuilder:
         }
         targets.append(stage)
 
-        # ===== 各スプライト（演奏者） =====
+        # ピアノロール用鍵盤スプライト
+        if self.enable_piano_roll:
+            self._prepare_piano_roll(track_voices)
+            if self.pr_ready:
+                kb_blocks = {}
+                # 1. 旗が押されたとき（次のブロックのIDを "b_keyboard_2" に指定）
+                kb_blocks["b_keyboard_1"] = {
+                    "opcode": "event_whenflagclicked",
+                    "next": "b_keyboard_2",
+                    "parent": None,
+                    "inputs": {},
+                    "fields": {},
+                    "shadow": False,
+                    "topLevel": True
+                }
+                # 2. 最前面へ移動する（looks_gotofrontback）を追加！
+                kb_blocks["b_keyboard_2"] = {
+                    "opcode": "looks_gotofrontback",
+                    "next": None,
+                    "parent": "b_keyboard_1",
+                    "inputs": {},
+                    "fields": {
+                        "FRONT_BACK": ["front",None]
+                    },
+                    "shadow": False,
+                    "topLevel": False
+                }
+                keyboard_sprite = {
+                    
+                    
+                    "isStage": False,
+                    "name": "鍵盤",
+                    "variables": {},
+                    "lists": {},
+                    "broadcasts": {},
+                    "blocks": kb_blocks,
+                    "comments": {},
+                    "currentCostume": 0,
+                    "costumes": [self.pr_keyboard_costume],
+                    "sounds": [],
+                    "volume": 100,
+                    "layerOrder": 1,
+                    "visible": True,
+                    "x": 0,
+                    "y": (self.KEYBOARD_TOP_Y + self.KEYBOARD_BOTTOM_Y) / 2,
+                    "size": 100,
+                    "direction": 90,
+                    "rotationStyle": "all around"
+                }
+                targets.append(keyboard_sprite)
+            else:
+                self._log("ピアノロール用の鍵盤スプライト追加をスキップしました")
+        layer_base = 2 if (self.enable_piano_roll and self.pr_ready) else 1
+
+        # 各演奏スプライト
         for idx, tv in enumerate(track_voices):
             sprite_name = f"R{tv['rank']}_T{tv['track_idx']}_V{tv['voice_idx']}_Vol{tv['volume']}"
             blocks = {}
             volume = tv['volume']
 
-            def add_block(b_id, opcode, next_id, parent_id, inputs=None, fields=None, top=False):
+            def add_block(b_id, opcode, next_id, parent_id, inputs=None, fields=None, top=False, shadow=False):
                 blocks[b_id] = {
                     "opcode": opcode,
                     "next": next_id,
                     "parent": parent_id,
                     "inputs": inputs or {},
                     "fields": fields or {},
-                    "shadow": False,
+                    "shadow": shadow,
                     "topLevel": top
                 }
 
@@ -362,41 +618,29 @@ class ScratchProjectBuilder:
                 b_counter += 1
                 return f"b_{sprite_name}_{b_counter}"
 
-            # 旗クリックで起動（同期なし・シンプル）
             prev_id = get_id()
-            add_block(
-                prev_id,
-                "event_whenflagclicked",
-                None,
-                None,
-                top=True
-            )
+            add_block(prev_id, "event_whenflagclicked", None, None, top=True)
 
-            # 音量設定
             curr_id = get_id()
             blocks[prev_id]["next"] = curr_id
             add_block(curr_id, "sound_setvolumeto", None, prev_id, {"VOLUME": [1, [4, str(volume)]]})
             prev_id = curr_id
 
-            # 初期テンポ設定
             curr_id = get_id()
             blocks[prev_id]["next"] = curr_id
             add_block(curr_id, "music_setTempo", None, prev_id, {"TEMPO": [1, [4, str(self.tempo_map[0][1])]]})
             prev_id = curr_id
 
-            # 楽器設定（ドラム以外）
             if not tv['is_drum']:
                 curr_id = get_id()
                 blocks[prev_id]["next"] = curr_id
-                inst_scratch = get_scratch_instrument(tv['instrument'], self.genre)
+                inst_scratch = get_scratch_instrument(tv['instrument'], self.genre, tv.get('track_name'))
                 add_block(curr_id, "music_setInstrument", None, prev_id, {"INSTRUMENT": [1, [4, str(inst_scratch)]]})
                 prev_id = curr_id
 
-            # ノート演奏（テンポ変更処理付き）
             current_tick = 0
             tempo_idx = 0
             for note in tv['notes']:
-                # テンポ変更処理
                 while tempo_idx + 1 < len(self.tempo_map) and self.tempo_map[tempo_idx+1][0] <= note.start_tick:
                     next_tick, next_bpm = self.tempo_map[tempo_idx+1]
                     wait_ticks = next_tick - current_tick
@@ -413,7 +657,6 @@ class ScratchProjectBuilder:
                     prev_id = curr_id
                     tempo_idx += 1
 
-                # ノート開始までの待機
                 wait_ticks = note.start_tick - current_tick
                 if wait_ticks > 0.01:
                     wait_beats = wait_ticks / self.ticks_per_beat
@@ -423,7 +666,6 @@ class ScratchProjectBuilder:
                     prev_id = curr_id
                     current_tick = note.start_tick
 
-                # ノート演奏
                 dur_ticks = note.end_tick - note.start_tick
                 dur_beats = dur_ticks / self.ticks_per_beat
                 curr_id = get_id()
@@ -442,6 +684,108 @@ class ScratchProjectBuilder:
                 prev_id = curr_id
                 current_tick = note.end_tick
 
+            # ピアノロールアニメーション（ドラム以外）
+            piano_roll_costumes = []
+            sprite_visible = True
+            if self.enable_piano_roll and self.pr_ready and not tv['is_drum'] and tv['notes']:
+                sprite_visible = False
+
+                vis_id = get_id()
+                add_block(vis_id, "event_whenflagclicked", None, None, top=True)
+                vis_prev = vis_id
+
+                hide_id = get_id()
+                blocks[vis_prev]["next"] = hide_id
+                add_block(hide_id, "looks_hide", None, vis_prev)
+                vis_prev = hide_id
+
+                hue = self.pr_track_hues.get(tv['track_idx'], 0)
+                eff_id = get_id()
+                blocks[vis_prev]["next"] = eff_id
+                add_block(eff_id, "looks_seteffectto", None, vis_prev,
+                           inputs={"VALUE": [1, [4, str(hue)]]},
+                           fields={"EFFECT": ["COLOR", None]})
+                vis_prev = eff_id
+
+                last_spawn_time = 0.0
+                used_costume_names = set()
+                for note in tv['notes']:
+                    onset = self._tick_to_seconds(note.start_tick)
+                    end = self._tick_to_seconds(note.end_tick)
+                    duration = max(0.0, end - onset)
+                    spawn_time = max(0.0, onset - self.FALL_LEAD_TIME)
+                    delta = spawn_time - last_spawn_time
+
+                    if delta > 0.01:
+                        wait_id = get_id()
+                        blocks[vis_prev]["next"] = wait_id
+                        add_block(wait_id, "control_wait", None, vis_prev,
+                                   inputs={"DURATION": [1, [4, str(round(delta, 3))]]})
+                        vis_prev = wait_id
+                        last_spawn_time = spawn_time
+
+                    x_pos = self._pitch_to_x(note.pitch)
+                    height_px = self._duration_to_height_px(duration)
+                    costume_info = self.pr_height_buckets[height_px]
+                    costume_name = costume_info["name"]
+                    used_costume_names.add(costume_name)
+
+                    goto_id = get_id()
+                    blocks[vis_prev]["next"] = goto_id
+                    add_block(goto_id, "motion_gotoxy", None, vis_prev, inputs={
+                        "X": [1, [4, str(round(x_pos, 1))]],
+                        "Y": [1, [4, str(self.FALL_TOP_Y)]]
+                    })
+                    vis_prev = goto_id
+
+                    switch_id = get_id()
+                    costume_shadow_id = get_id()
+                    blocks[vis_prev]["next"] = switch_id
+                    add_block(switch_id, "looks_switchcostumeto", None, vis_prev,
+                               inputs={"COSTUME": [1, costume_shadow_id]})
+                    add_block(costume_shadow_id, "looks_costume", None, switch_id,
+                               fields={"COSTUME": [costume_name, None]}, shadow=True)
+                    vis_prev = switch_id
+
+                    clone_id = get_id()
+                    clone_shadow_id = get_id()
+                    blocks[vis_prev]["next"] = clone_id
+                    add_block(clone_id, "control_create_clone_of", None, vis_prev,
+                               inputs={"CLONE_OPTION": [1, clone_shadow_id]})
+                    add_block(clone_shadow_id, "control_create_clone_of_menu", None, clone_id,
+                               fields={"CLONE_OPTION": ["_myself_", None]}, shadow=True)
+                    vis_prev = clone_id
+
+                clone_hat_id = get_id()
+                add_block(clone_hat_id, "control_start_as_clone", None, None, top=True)
+
+                show_id = get_id()
+                blocks[clone_hat_id]["next"] = show_id
+                add_block(show_id, "looks_show", None, clone_hat_id)
+
+                glide_id = get_id()
+                xpos_id = get_id()
+                blocks[show_id]["next"] = glide_id
+                add_block(glide_id, "motion_glidesecstoxy", None, show_id, inputs={
+                    "SECS": [1, [4, str(self.FALL_LEAD_TIME)]],
+                    "X": [3, xpos_id, [4, "0"]],
+                    "Y": [1, [4, str(self.KEYBOARD_TOP_Y)]]
+                })
+                add_block(xpos_id, "motion_xposition", None, glide_id)
+
+                delete_id = get_id()
+                blocks[glide_id]["next"] = delete_id
+                add_block(delete_id, "control_delete_this_clone", None, glide_id)
+
+                for h, info in self.pr_height_buckets.items():
+                    if info["name"] in used_costume_names:
+                        piano_roll_costumes.append({
+                            "assetId": info["assetId"],
+                            "name": info["name"],
+                            "md5ext": info["md5ext"],
+                            "dataFormat": info["dataFormat"]
+                        })
+
             sprite = {
                 "isStage": False,
                 "name": sprite_name,
@@ -451,11 +795,11 @@ class ScratchProjectBuilder:
                 "blocks": blocks,
                 "comments": {},
                 "currentCostume": 0,
-                "costumes": [{"assetId": self.svg_md5, "name": "costume1", "md5ext": self.svg_filename, "dataFormat": "svg"}],
+                "costumes": [{"assetId": self.svg_md5, "name": "costume1", "md5ext": self.svg_filename, "dataFormat": "svg"}] + piano_roll_costumes,
                 "sounds": [],
                 "volume": 100,
-                "layerOrder": idx + 1,
-                "visible": True,
+                "layerOrder": idx + layer_base,
+                "visible": sprite_visible,
                 "x": 0,
                 "y": 0,
                 "size": 100,
@@ -479,6 +823,8 @@ class ScratchProjectBuilder:
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as sb3:
             sb3.writestr('project.json', json.dumps(project_json))
             sb3.writestr(self.svg_filename, self.svg_data)
+            for filename, data in self.pr_extra_assets.items():
+                sb3.writestr(filename, data)
         self._log(f"sb3出力完了: {output_path}")
         return output_path
 
@@ -513,6 +859,14 @@ class App(tk.Tk):
         tk.Label(frm_top, text="主旋律トラック (自動ランク付け・音量調整):").pack(pady=(10,0))
         self.combo_main = ttk.Combobox(frm_top, state="readonly", width=50)
         self.combo_main.pack(pady=2)
+
+        self.piano_roll_var = tk.BooleanVar(value=False)
+        self.chk_piano_roll = tk.Checkbutton(
+            frm_top,
+            text="ピアノロール風アニメーションを追加（上から鍵盤にノートが降ってくる）",
+            variable=self.piano_roll_var
+        )
+        self.chk_piano_roll.pack(pady=(8, 0))
 
         self.btn_convert = tk.Button(frm_top, text="sb3ファイルを作成", command=self.convert, state=tk.DISABLED,
                                      bg="#4CAF50", fg="white", font=("", 12, "bold"))
@@ -564,7 +918,7 @@ class App(tk.Tk):
                         is_drum = True
                     if msg.type == 'note_on' and msg.velocity > 0:
                         if is_drum and get_scratch_drum(msg.note) is None: continue
-                        if not is_drum and get_scratch_instrument(current_instrument) is None: continue
+                        if not is_drum and get_scratch_instrument(current_instrument, track_name=name) is None: continue
                         note_count += 1
                         total_pitch += msg.note
                 if not is_drum and note_count > 0:
@@ -587,10 +941,11 @@ class App(tk.Tk):
         selected_idx = 0
         if self.combo_main.get():
             selected_idx = int(self.combo_main.get().split(":")[0])
-        self.log_message(f"変換開始: メイントラック={selected_idx}, ジャンル={self.genre_var.get()}")
+        self.log_message(f"変換開始: メイントラック={selected_idx}, ジャンル={self.genre_var.get()}, ピアノロール={self.piano_roll_var.get()}")
         try:
             builder = ScratchProjectBuilder(
                 self.midi_path, selected_idx, self.genre_var.get(),
+                enable_piano_roll=self.piano_roll_var.get(),
                 log_callback=self.log_message
             )
             out_file = builder.build_sb3()
